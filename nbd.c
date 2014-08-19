@@ -6,6 +6,9 @@
  * 
  * Copyright 1997-2000 Pavel Machek <pavel@ucw.cz>
  * Parts copyright 2001 Steven Whitehouse <steve@chygwyn.com>
+ * 
+ * 2014 Backported feature of pid file
+ *      by Alexander Suvorov <alexander.suvorov@softheme.com>
  *
  * This file is released under GPLv2 or later.
  *
