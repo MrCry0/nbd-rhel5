@@ -29,6 +29,9 @@
 #include <linux/kernel.h>
 #include <net/sock.h>
 
+#include <linux/wait.h>
+#include <linux/mutex.h>
+
 #include <asm/uaccess.h>
 #include <asm/system.h>
 #include <asm/types.h>
@@ -52,8 +55,33 @@
 static unsigned int debugflags;
 #endif /* NDEBUG */
 
+struct request;
+
+struct nbd_dev {
+	int flags;
+	int harderror;		/* Code of hard error			*/
+	struct socket * sock;
+	struct file * file; 	/* If == NULL, device is not ready, yet	*/
+	int magic;
+
+	spinlock_t queue_lock;
+	struct list_head queue_head;/* Requests are added here...	*/
+	struct request *active_req;
+	wait_queue_head_t active_wq;
+
+	struct mutex tx_lock;
+	struct gendisk *disk;
+
+	struct device dev;
+
+	int blksize;
+	u64 bytesize;
+
+	pid_t pid; /* pid of nbd-client, if attached */
+};
+
 static unsigned int nbds_max = 16;
-static struct nbd_device nbd_dev[MAX_NBD];
+static struct nbd_dev nbd_dev[MAX_NBD];
 
 /*
  * Use just one lock (or at most 1 per NIC). Two arguments for this:
@@ -188,7 +216,7 @@ static inline int sock_send_bvec(struct socket *sock, struct bio_vec *bvec,
 	return result;
 }
 
-static int nbd_send_req(struct nbd_device *lo, struct request *req)
+static int nbd_send_req(struct nbd_dev *lo, struct request *req)
 {
 	int result, i, flags;
 	struct nbd_request request;
@@ -245,7 +273,7 @@ error_out:
 	return 1;
 }
 
-static struct request *nbd_find_request(struct nbd_device *lo, char *handle)
+static struct request *nbd_find_request(struct nbd_dev *lo, char *handle)
 {
 	struct request *req;
 	struct list_head *tmp;
@@ -286,7 +314,7 @@ static inline int sock_recv_bvec(struct socket *sock, struct bio_vec *bvec)
 }
 
 /* NULL returned = something went wrong, inform userspace */
-static struct request *nbd_read_stat(struct nbd_device *lo)
+static struct request *nbd_read_stat(struct nbd_dev *lo)
 {
 	int result;
 	struct nbd_reply reply;
@@ -355,18 +383,41 @@ harderror:
 	return NULL;
 }
 
-static void nbd_do_it(struct nbd_device *lo)
+static ssize_t pid_show(struct gendisk *disk, char *buf)
+{
+	return snprintf(buf, PAGE_SIZE, "%ld\n",
+		(long) ((struct nbd_dev *)disk->private_data)->pid);
+}
+
+static struct device_attribute pid_attr = {
+	.attr = { .name = "pid", .mode = S_IRUGO },
+	.show = pid_show,
+};
+
+static void nbd_do_it(struct nbd_dev *lo)
 {
 	struct request *req;
+	int ret;
+	struct gendisk *disk = lo->disk;
 
 	BUG_ON(lo->magic != LO_MAGIC);
 
+	lo->pid = current->pid;
+	ret = sysfs_create_file(&disk->kobj, &pid_attr.attr);
+	if (ret) {
+		printk("nbd: sysfs_create_file failed!");
+		return;
+	}
+
 	while ((req = nbd_read_stat(lo)) != NULL)
 		nbd_end_request(req);
+
+	sysfs_remove_file(&disk->kobj, &pid_attr.attr);
+
 	return;
 }
 
-static void nbd_clear_que(struct nbd_device *lo)
+static void nbd_clear_que(struct nbd_dev *lo)
 {
 	struct request *req;
 
@@ -404,7 +455,7 @@ static void do_nbd_request(request_queue_t * q)
 	struct request *req;
 	
 	while ((req = elv_next_request(q)) != NULL) {
-		struct nbd_device *lo;
+		struct nbd_dev *lo;
 
 		blkdev_dequeue_request(req);
 		dprintk(DBG_BLKDEV, "%s: request %p: dequeued (flags=%lx)\n",
@@ -473,7 +524,7 @@ error_out:
 static int nbd_ioctl(struct inode *inode, struct file *file,
 		     unsigned int cmd, unsigned long arg)
 {
-	struct nbd_device *lo = inode->i_bdev->bd_disk->private_data;
+	struct nbd_dev *lo = inode->i_bdev->bd_disk->private_data;
 	int error;
 	struct request sreq ;
 
